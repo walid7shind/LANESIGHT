@@ -1,0 +1,8 @@
+# Ignore generated/local folders at repo root
+data/
+test_output/
+
+# Python caches (specific + general)
+models/__pycache__/
+__pycache__/
+*.py[cod]

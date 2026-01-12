@@ -1,7 +1,8 @@
 import torch
 from torch import nn
 from .blocks import ConvBNAct, Down, Up
-from .vit import ViTBottleneck
+from .vit_monster import ViTBottleneckMonster
+
 
 class HybridViTUNet(nn.Module):
     def __init__(self, num_classes: int, img_size_hw=(288, 800), base=48):
@@ -21,14 +22,21 @@ class HybridViTUNet(nn.Module):
 
         # ViT bottleneck on f4 at (H/16, W/16)
         fH, fW = H // 16, W // 16
-        self.vit = ViTBottleneck(
-            channels=base*8,
-            feat_size_hw=(fH, fW),
-            patch=2,        # patchify on feature map
-            depth=6,
-            heads=8,
-            dropout=0.0
-        )
+        self.vit = ViTBottleneckMonster(
+        channels=base * 8,
+        feat_hw=(fH, fW),
+        patch=2,
+        depth=8,                 # stronger
+        heads=8,
+        mlp_ratio=4.0,
+        attn_dropout=0.1,
+        dropout=0.1,
+        drop_path=0.1,           # stochastic depth
+        use_relpos=True,         # CRITICAL for lanes
+        use_abspos=False,        # relpos > abspos here
+        dynamic_relpos=False     # fixed resolution (faster)
+     )
+
 
         # Decoder (UNet)
         self.up3 = Up(in_ch=base*8, skip_ch=base*4, out_ch=base*4)  # /8
@@ -50,7 +58,12 @@ class HybridViTUNet(nn.Module):
         f4 = self.down3(f3)   # (B, 8b,   H/16,W/16)
 
         # ViT bottleneck (global context)
-        z4 = self.vit(f4)     # (B, 8b, H/16,W/16)
+        z4, vit_trace = self.vit(
+        f4,
+        return_trace=self.training,   # trace only during training
+        capture_attn=False            # VERY expensive if True
+        )
+        # (B, 8b, H/16,W/16)
 
         # Decoder
         z3 = self.up3(z4, f3) # (B, 4b, H/8, W/8)

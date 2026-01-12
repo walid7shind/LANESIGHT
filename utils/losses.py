@@ -2,29 +2,91 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SoftDiceLoss(nn.Module):
-    def __init__(self, smooth=1.0):
+
+# -------------------------------------------------
+# Binary Lane Dice Loss (foreground only)
+# -------------------------------------------------
+class LaneDiceLoss(nn.Module):
+    """
+    Dice loss computed ONLY on lane pixels (class = 1).
+    Uses sigmoid (NOT softmax).
+    """
+    def __init__(self, ignore_index=255, smooth=1.0):
         super().__init__()
+        self.ignore_index = ignore_index
         self.smooth = smooth
 
-    def forward(self, logits, target, num_classes):
-        # logits: (B,K,H,W), target: (B,H,W)
-        probs = F.softmax(logits, dim=1)
-        target_1h = F.one_hot(target, num_classes=num_classes).permute(0,3,1,2).float()
-        dims = (0,2,3)
-        inter = torch.sum(probs * target_1h, dims)
-        union = torch.sum(probs + target_1h, dims)
-        dice = (2 * inter + self.smooth) / (union + self.smooth)
-        return 1.0 - dice.mean()
+    def forward(self, logits, target):
+        """
+        logits: (B, 2, H, W)
+        target: (B, H, W) ∈ {0,1}
+        """
+        # take lane channel only
+        lane_logits = logits[:, 1, :, :]          # (B,H,W)
+        probs = torch.sigmoid(lane_logits)        # (B,H,W)
 
+        # valid pixels
+        valid_mask = target != self.ignore_index
+
+        target = (target == 1).float()
+
+        probs = probs * valid_mask
+        target = target * valid_mask
+
+        dims = (0, 1, 2)
+
+        inter = torch.sum(probs * target, dims)
+        union = torch.sum(probs + target, dims)
+
+        dice = (2.0 * inter + self.smooth) / (union + self.smooth)
+
+        return 1.0 - dice
+
+
+# -------------------------------------------------
+# Combined Segmentation Loss (Weighted CE + Dice)
+# -------------------------------------------------
 class SegLoss(nn.Module):
-    def __init__(self, num_classes, ce_w=1.0, dice_w=0.5, ignore_index=255):
+    """
+    Final binary segmentation loss:
+      Weighted CrossEntropy (pixel accuracy)
+    + Dice loss (lane shape consistency)
+    """
+    def __init__(
+        self,
+        ce_weight=1.0,
+        dice_weight=1.0,
+        ignore_index=255,
+        class_weights=(0.3, 3.0),   # background, lane
+    ):
         super().__init__()
-        self.num_classes = num_classes
-        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index)
-        self.dice = SoftDiceLoss()
-        self.ce_w = ce_w
-        self.dice_w = dice_w
+
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+
+        self.ignore_index = ignore_index
+
+        self.register_buffer(
+            "class_weights",
+            torch.tensor(class_weights, dtype=torch.float32),
+            persistent=False,
+        )
+
+        self.dice = LaneDiceLoss(
+            ignore_index=ignore_index
+        )
 
     def forward(self, logits, target):
-        return self.ce_w * self.ce(logits, target) + self.dice_w * self.dice(logits, target, self.num_classes)
+        weight = None
+        if self.class_weights is not None:
+            weight = self.class_weights.to(device=logits.device)
+
+        loss_ce = F.cross_entropy(
+            logits,
+            target,
+            weight=weight,
+            ignore_index=self.ignore_index,
+        )
+        loss_dice = self.dice(logits, target)
+
+        return self.ce_weight * loss_ce + self.dice_weight * loss_dice
