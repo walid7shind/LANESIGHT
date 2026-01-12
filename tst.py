@@ -8,8 +8,8 @@ from models.hybrid_vit_unet import HybridViTUNet
 # CONFIG
 # -------------------------
 CKPT_PATH = "checkpoints/best.pt"
-IMG_PATH  = r"C:\Users\walid\dev\vision\LANESIGHT\data\driver_23_30frame\05161653_0627.MP4\02155.jpg"
-OUT_PATH  = r"C:\Users\walid\dev\vision\LANESIGHT\test_output\overlay.png"
+IMG_PATH  = r"C:\Users\walid\dev\vision\LANESIGHT\test_images\road1.jpg"
+OUT_PATH  = r"C:\Users\walid\dev\vision\LANESIGHT\overlay.png"
 
 DEVICE = "cpu"   # IMPORTANT (RTX 5060 not supported yet)
 
