@@ -7,3 +7,60 @@ models/__pycache__/
 __pycache__/
 *.py[cod]
 checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment/config secrets
+.env
+.env.*
+*.secrets.*
+*.pem
+*.key
+
+# Python packaging/build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.whl
+
+# Test/coverage/type checking
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+junit.xml
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs & local runtime artifacts
+*.log
+logs/
+runs/
+wandb/
+mlruns/
+tensorboard/
+tmp/
+cache/
+
+# IDE/editor
+.vscode/
+.idea/
+*.iml
+
+# OS cruft
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -5,9 +5,19 @@ from .vit_monster import ViTBottleneckMonster
 
 
 class HybridViTUNet(nn.Module):
-    def __init__(self, num_classes: int, img_size_hw=(288, 800), base=48):
+    def __init__(
+        self,
+        num_classes: int,
+        img_size_hw=(288, 800),
+        base=48,
+        vit_return_trace: bool = False,
+    ):
         super().__init__()
         H, W = img_size_hw
+
+        # NOTE: ViT tracing collects stats via .cpu()/float() which forces GPU sync.
+        # Keep it off by default; enable only when you actually log/inspect it.
+        self.vit_return_trace = vit_return_trace
 
         # Stem (H,W) -> (H/2,W/2)
         self.stem = nn.Sequential(
@@ -58,10 +68,12 @@ class HybridViTUNet(nn.Module):
         f4 = self.down3(f3)   # (B, 8b,   H/16,W/16)
 
         # ViT bottleneck (global context)
-        z4, vit_trace = self.vit(
-        f4,
-        return_trace=self.training,   # trace only during training
-        capture_attn=False            # VERY expensive if True
+        # NOTE: return_trace triggers lots of .cpu()/float() calls inside vit_monster,
+        # which forces GPU synchronizations and can slow training significantly.
+        z4, _ = self.vit(
+            f4,
+            return_trace=False,
+            capture_attn=False,  # VERY expensive if True
         )
         # (B, 8b, H/16,W/16)
 

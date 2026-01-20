@@ -3,10 +3,12 @@ import sys
 import time
 import torch
 from torch.utils.data import DataLoader
+import inspect
 
 from data.culane_dataset import CULaneDataset
 from models.hybrid_vit_unet import HybridViTUNet
 from utils.losses import SegLoss
+from utils.photometric import photometric_augment
 
 
 # -------------------------------------------------
@@ -61,15 +63,26 @@ def train(
     train_list,
     val_list,
     img_size=(288, 800),
-    epochs=30,
+    epochs=8,
     bs=6,
     lr=3e-4,
     num_workers=4,
     device=None,
+    photometric_aug=True,
 ):
     seed_everything(42)
 
     device, use_cuda = _pick_device(device)
+
+    if use_cuda:
+        # Speed knobs: safe defaults for training
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     print(f"[INFO] Device: {device}")
     print(f"[INFO] Image size: {img_size}")
@@ -79,12 +92,30 @@ def train(
     tr_ds = CULaneDataset(root, train_list, img_size=img_size, augment=True)
     va_ds = CULaneDataset(root, val_list, img_size=img_size, augment=False)
 
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": use_cuda,
+    }
+    if num_workers > 0:
+        loader_kwargs.update(
+            {
+                "persistent_workers": True,
+                "prefetch_factor": 4,
+            }
+        )
+    if use_cuda:
+        # Only available on some torch versions
+        try:
+            if "pin_memory_device" in inspect.signature(DataLoader).parameters:
+                loader_kwargs["pin_memory_device"] = "cuda"
+        except Exception:
+            pass
+
     tr_loader = DataLoader(
         tr_ds,
         batch_size=bs,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=use_cuda,
+        **loader_kwargs,
         drop_last=True,
     )
 
@@ -92,8 +123,7 @@ def train(
         va_ds,
         batch_size=bs,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=use_cuda,
+        **loader_kwargs,
     )
 
     # ---------------- Model ----------------
@@ -141,11 +171,14 @@ def train(
 
         # ---------- TRAIN ----------
         model.train()
-        train_loss = 0.0
+        train_loss_sum = torch.zeros((), device=device)
 
         for imgs, masks in tr_loader:
             imgs = imgs.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
+
+            if photometric_aug:
+                imgs = photometric_augment(imgs)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -162,13 +195,13 @@ def train(
             scaler.step(optimizer)
             scaler.update()
 
-            train_loss += loss.item()
+            train_loss_sum = train_loss_sum + loss.detach()
 
-        train_loss /= len(tr_loader)
+        train_loss = float((train_loss_sum / len(tr_loader)).cpu())
 
         # ---------- VALIDATION ----------
         model.eval()
-        val_loss = 0.0
+        val_loss_sum = torch.zeros((), device=device)
 
         with torch.no_grad():
             for imgs, masks in va_loader:
@@ -179,9 +212,9 @@ def train(
                     logits = model(imgs)
                     loss = loss_fn(logits, masks)
 
-                val_loss += loss.item()
+                val_loss_sum = val_loss_sum + loss.detach()
 
-        val_loss /= len(va_loader)
+            val_loss = float((val_loss_sum / len(va_loader)).cpu())
 
         scheduler.step()
         dt = time.time() - t0
@@ -223,8 +256,8 @@ if __name__ == "__main__":
 
     data_root = os.path.join(script_dir, "data")
 
-    train_list = os.path.join(data_root, "list", "train_gt - Copy.txt")
-    val_list   = os.path.join(data_root, "list", "val_gt - Copy.txt")
+    train_list = os.path.join(data_root, "list", "train_clean.txt")
+    val_list   = os.path.join(data_root, "list", "val_clean.txt")
 
     train(
         root=data_root,

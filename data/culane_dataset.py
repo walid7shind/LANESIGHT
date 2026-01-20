@@ -5,6 +5,13 @@ from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 import numpy as np
 
+# OpenCV can spawn its own threadpool per worker process; with PyTorch DataLoader
+# workers this can cause CPU oversubscription and slowdowns.
+try:
+    cv2.setNumThreads(0)
+except Exception:
+    pass
+
 class CULaneDataset(Dataset):
     """
     Expects list lines:
@@ -34,16 +41,11 @@ class CULaneDataset(Dataset):
         return len(self.lines)
 
     def _aug(self, img, mask):
-        # simple + safe augmentations (no geometry heavy stuff unless you handle masks carefully)
-        if np.random.rand() < 0.5:
-            img = np.ascontiguousarray(img[:, ::-1])
-            mask = np.ascontiguousarray(mask[:, ::-1])
-
-        # brightness/contrast
-        if np.random.rand() < 0.5:
-            alpha = 0.8 + 0.4 * np.random.rand()  # contrast
-            beta = (np.random.rand() - 0.5) * 20  # brightness
-            img = np.clip(alpha * img + beta, 0, 255).astype(np.uint8)
+        # IMPORTANT:
+        # - Photometric augmentation is applied ONLY to the RGB image (on-GPU in train.py).
+        # - Geometric augmentation (warp) must be applied identically to BOTH image and mask.
+        #
+        # This dataset stays geometry-neutral by default to avoid label corruption.
         return img, mask
 
     def __getitem__(self, idx):
