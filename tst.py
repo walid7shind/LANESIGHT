@@ -12,8 +12,8 @@ from models.hybrid_vit_unet import HybridViTUNet
 BASE_DIR = Path(__file__).resolve().parent
 
 CKPT_PATH = BASE_DIR / "checkpoints" / "best.pt"
-FRAMES_DIR = BASE_DIR / "test_output"
-OUT_DIR = BASE_DIR / "test_images"
+FRAMES_DIR = BASE_DIR / "test_images"
+OUT_DIR = BASE_DIR / "test_output"
 
 # If FRAMES_DIR is a video file, process every Nth frame.
 FRAME_STRIDE = 5
@@ -61,7 +61,22 @@ if FRAMES_DIR.is_dir():
         for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp")
         for p in FRAMES_DIR.glob(ext)
     )
-    assert img_paths, f"No images found in {FRAMES_DIR}"
+    if not img_paths:
+        video_candidates = sorted(
+            p
+            for ext in ("*.mp4", "*.avi", "*.mov", "*.mkv")
+            for p in FRAMES_DIR.glob(ext)
+        )
+        if len(video_candidates) == 1:
+            video_path = video_candidates[0]
+            print(f"No images found; using video: {video_path}")
+        elif len(video_candidates) > 1:
+            video_path = video_candidates[0]
+            print(
+                f"No images found; multiple videos found, using first: {video_path}"
+            )
+        else:
+            raise AssertionError(f"No images or videos found in {FRAMES_DIR}")
 elif FRAMES_DIR.is_file():
     video_path = FRAMES_DIR
 else:
@@ -75,7 +90,7 @@ palette = np.array([
     [255, 0,   0],    # lane
 ], dtype=np.uint8)
 
-def _process_bgr(frame_bgr: np.ndarray, index: int) -> None:
+def _process_bgr(frame_bgr: np.ndarray, index: int) -> np.ndarray:
     orig_h, orig_w = frame_bgr.shape[:2]
 
     # ---------- LANE SEG ----------
@@ -103,37 +118,72 @@ def _process_bgr(frame_bgr: np.ndarray, index: int) -> None:
     )
     final_overlay = results[0].plot(img=lane_overlay)
 
-    out_path = OUT_DIR / f"overlay_.png"
-    cv2.imwrite(str(out_path), final_overlay)
+    return final_overlay
+
 
 
 # =================================================
 # PROCESS (images or video)
+# =================================================
+# =================================================
+# PROCESS VIDEO → VIDEO (10 FPS)
 # =================================================
 if video_path is not None:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
-    i = 0
-    out_idx = 0
+    fps_in = cap.get(cv2.CAP_PROP_FPS)
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    fps_out = 10.0
+
+    out_path = OUT_DIR / "output_10fps.mp4"
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(
+        str(out_path),
+        fourcc,
+        fps_out,
+        (width, height),
+    )
+
+    if not writer.isOpened():
+        raise RuntimeError("VideoWriter failed to open")
+
+    frame_idx = 0
+    written_frames = 0
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        if FRAME_STRIDE > 1 and (i % FRAME_STRIDE != 0):
-            i += 1
-            continue
-        _process_bgr(frame, out_idx)
-        out_idx += 1
-        i += 1
+
+        t_in = frame_idx / fps_in
+        t_out = written_frames / fps_out
+
+        if t_in >= t_out:
+            processed = _process_bgr(frame, written_frames)
+            writer.write(processed)
+            written_frames += 1
+
+        frame_idx += 1
 
     cap.release()
-else:
-    for i, img_path in enumerate(img_paths):
-        img_bgr = cv2.imread(str(img_path))
-        if img_bgr is None:
-            continue
-        _process_bgr(img_bgr, i)
+    writer.release()
 
-print(f"✔ Done. Wrote overlays to: {OUT_DIR}")
+    print(f"✔ Video written: {out_path}")
+
+else:
+    # PROCESS IMAGES → IMAGES
+    for i, img_path in enumerate(img_paths):
+        frame = cv2.imread(str(img_path))
+        if frame is None:
+            print(f"Skipping unreadable image: {img_path}")
+            continue
+        processed = _process_bgr(frame, i)
+        out_path = OUT_DIR / f"{img_path.stem}_out.png"
+        cv2.imwrite(str(out_path), processed)
+
+    print(f"✔ Images written to: {OUT_DIR}")
