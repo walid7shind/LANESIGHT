@@ -1,0 +1,5 @@
+## External dependency
+This project uses Ultra-Fast-Lane-Detection.
+
+Setup:
+git clone https://github.com/cfzd/Ultra-Fast-Lane-Detection.git

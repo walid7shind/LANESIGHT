@@ -1,76 +1,12 @@
 from __future__ import annotations
-
-import argparse
-import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import List, Tuple
 
 import cv2
 import numpy as np
 
 Array = np.ndarray
-TorchTensor = Any
-
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-CKPT_PATH = ROOT / "checkpoints" / "best.pt"
-BASE_DIR = ROOT / "test_output"  # base frames (no predicted lanes)
-OUT_DIR = ROOT / "test_images"
-
-# Outputs (keep both spellings; user asked for overlay_proccessed.png)
-OUT_OVERLAY = OUT_DIR / "overlay_proccessed.png"
-OUT_OVERLAY_ALT = OUT_DIR / "overlay_processed.png"
-OUT_MASK_RAW = OUT_DIR / "lane_mask_raw.png"
-OUT_MASK_PP = OUT_DIR / "lane_mask_pp.png"
-
-
-def _pick_base_image_path() -> Path:
-    exts = {".png", ".jpg", ".jpeg", ".bmp"}
-    imgs = [p for p in BASE_DIR.iterdir() if p.is_file() and p.suffix.lower() in exts]
-    if not imgs:
-        raise FileNotFoundError(f"No base images found in: {BASE_DIR}")
-    imgs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return imgs[0]
-
-
-def _load_lane_model(*, device: str):
-    import torch
-    from models.hybrid_vit_unet import HybridViTUNet
-
-    if not CKPT_PATH.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {CKPT_PATH}")
-
-    ckpt = torch.load(CKPT_PATH, map_location=device)
-    img_size = ckpt["img_size"]  # (H,W)
-    num_classes = int(ckpt["num_classes"])
-
-    model = HybridViTUNet(num_classes=num_classes, img_size_hw=img_size, base=48).to(device)
-    model.load_state_dict(ckpt["model"], strict=True)
-    model.eval()
-    return model, img_size, num_classes
-
-
-def _infer_lane_mask_argmax(model, *, img_bgr: Array, img_size_hw: Tuple[int, int], device: str) -> Array:
-    """Return raw lane mask (uint8 0/255) at original image resolution."""
-    import torch
-
-    H0, W0 = img_bgr.shape[:2]
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img_rs = cv2.resize(img_rgb, (int(img_size_hw[1]), int(img_size_hw[0])), interpolation=cv2.INTER_LINEAR)
-
-    x = (img_rs.astype(np.float32) / 255.0)
-    x = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        logits = model(x)
-        pred = logits.argmax(1)[0].detach().cpu().numpy().astype(np.uint8)
-
-    # lane class assumed to be 1 (as in tst.py)
-    mask = (pred == 1).astype(np.uint8) * 255
-    mask = cv2.resize(mask, (W0, H0), interpolation=cv2.INTER_NEAREST)
-    return mask
 
 
 def _line_kernel(length: int, angle_deg: float) -> Array:
@@ -261,6 +197,15 @@ class LanePostProcessor:
         self.cfg = cfg
 
     def process(self, bin_img: Array) -> Array:
+        """Post-process a binary lane mask.
+
+        Accepts masks in {0,1} or {0,255} (or bool), returns uint8 {0,255}.
+        """
+        if bin_img.dtype != np.uint8:
+            bin_img = bin_img.astype(np.uint8)
+        if bin_img.max() <= 1:
+            bin_img = bin_img * 255
+
         H, W = bin_img.shape
         min_area = int(self.cfg.min_area_frac * H * W)
 
@@ -288,63 +233,3 @@ class LanePostProcessor:
         out = directional_closing(out, k=int(self.cfg.closing_k))
         return out
 
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--base", type=str, default=None, help="Path to base image (no predicted lanes). Defaults to latest in test_output/.")
-    ap.add_argument("--device", type=str, default=None, help="'cuda' or 'cpu'. Default: auto")
-    ap.add_argument("--show", action="store_true", help="Show raw/pp masks in OpenCV windows.")
-    args = ap.parse_args()
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    base_path = Path(args.base) if args.base else _pick_base_image_path()
-    base = cv2.imread(str(base_path), cv2.IMREAD_COLOR)
-    if base is None:
-        raise FileNotFoundError(base_path)
-
-    # Device selection
-    device: str
-    if args.device:
-        device = args.device
-    else:
-        try:
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            device = "cpu"
-
-    model, img_size_hw, _ = _load_lane_model(device=device)
-
-    # 1) Model raw mask
-    mask_raw = _infer_lane_mask_argmax(model, img_bgr=base, img_size_hw=img_size_hw, device=device)
-    cv2.imwrite(str(OUT_MASK_RAW), mask_raw)
-
-    # 2) Post-process the mask
-    pp = LanePostProcessor(PostProcessConfig())
-    mask_pp = pp.process(mask_raw)
-    cv2.imwrite(str(OUT_MASK_PP), mask_pp)
-
-    # 3) Overlay onto base
-    overlay = base.copy()
-    overlay[mask_pp > 0] = (0, 0, 255)
-    out = cv2.addWeighted(base, 1.0, overlay, 0.60, 0)
-    cv2.imwrite(str(OUT_OVERLAY), out)
-    cv2.imwrite(str(OUT_OVERLAY_ALT), out)
-
-    if args.show:
-        cv2.imshow("mask_raw", mask_raw)
-        cv2.imshow("mask_pp", mask_pp)
-        cv2.imshow("overlay", out)
-        cv2.waitKey(0)
-
-    print("Base:", base_path)
-    print("Saved:")
-    print(" -", OUT_MASK_RAW)
-    print(" -", OUT_MASK_PP)
-    print(" -", OUT_OVERLAY)
-    print(" -", OUT_OVERLAY_ALT)
-
-
-if __name__ == "__main__":
-    main()
