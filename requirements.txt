@@ -1,0 +1,14 @@
+streamlit>=1.31
+
+# UI runtime
+numpy
+opencv-python
+
+# Engine runtime dependencies (LANESIGHT + UFLD wrappers)
+scipy
+ultralytics
+addict
+tqdm
+tensorboard
+scikit-learn
+pathspec
