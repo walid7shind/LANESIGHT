@@ -1,55 +1,173 @@
-import cv2
-import torch
-import torchvision.transforms.functional as TF
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-from models.hybrid_vit_unet import HybridViTUNet
-from utils.vis import overlay
+import cv2
 
-@torch.no_grad()
-def run_video(input_path, output_path, ckpt="checkpoints/best.pt", device=None):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+from inference.ufld_wrapper import UFLDInferencer
+from inference.vit_hybrid_wrapper import ViTLaneInferencer
+from inference.yolo_wrapper import YOLOInferencer
+from inference.fusion import Lane, LaneSet, lanes_to_mask
+from traditional_proccessing.taditionalBS import traditional_polygon_mask
 
-    ck = torch.load(ckpt, map_location="cpu")
-    img_h, img_w = ck["img_size"]
-    num_classes = ck["num_classes"]
 
-    model = HybridViTUNet(num_classes=num_classes, img_size_hw=(img_h, img_w), base=48)
-    model.load_state_dict(ck["model"], strict=True)
-    model.to(device).eval()
+def _resolve_default_paths() -> Dict[str, Path]:
+	"""Resolve default model/config paths relative to the LANESIGHT repo."""
+	lanesight_root = Path(__file__).resolve().parents[1]
+	vision_root = lanesight_root.parent
+	ufld_root = vision_root / "UFLD" / "Ultra-Fast-Lane-Detection"
 
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {input_path}")
+	return {
+		"lanesight_root": lanesight_root,
+		"vision_root": vision_root,
+		"ufld_root": ufld_root,
+		"ufld_weights": ufld_root / "weights" / "culane_18.pth",
+		"ufld_config": ufld_root / "configs" / "culane.py",
+		"vit_ckpt": lanesight_root / "checkpoints" / "best.pt",
+		"yolo_weights": lanesight_root / "yolov8n.pt",
+	}
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    W0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (W0, H0))
+def yolo_detections_to_mask(
+	detections: List[dict],
+	shape_hw: Tuple[int, int],
+) -> np.ndarray:
+	"""Rasterize YOLO xyxy boxes into a uint8 {0,1} mask."""
+	h, w = shape_hw
+	mask = np.zeros((h, w), dtype=np.uint8)
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+	if not detections:
+		return mask
 
-        # preprocess
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_rs = cv2.resize(frame_rgb, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
-        x = TF.to_tensor(frame_rs).unsqueeze(0).to(device)
+	for det in detections:
+		x1, y1, x2, y2 = det.get("xyxy", (0, 0, 0, 0))
+		x1 = int(np.clip(x1, 0, w - 1))
+		x2 = int(np.clip(x2, 0, w - 1))
+		y1 = int(np.clip(y1, 0, h - 1))
+		y2 = int(np.clip(y2, 0, h - 1))
+		if x2 <= x1 or y2 <= y1:
+			continue
+		mask[y1:y2, x1:x2] = 1
 
-        logits = model(x)                 # (1,K,H,W)
-        pred = logits.argmax(1)[0].cpu().numpy().astype(np.uint8)  # (H,W)
+	return mask
 
-        # resize mask back to original frame size for overlay
-        pred_big = cv2.resize(pred, (W0, H0), interpolation=cv2.INTER_NEAREST)
-        vis = overlay(frame, pred_big, alpha=0.45, num_classes=num_classes)
 
-        out.write(vis)
+def ufld_lanes_to_mask(
+	ufld_lanes: List[np.ndarray],
+	shape_hw: Tuple[int, int],
+	*,
+	thickness: int = 6,
+) -> np.ndarray:
+	"""Rasterize UFLD lane polylines into a uint8 {0,1} mask."""
+	lane_set = LaneSet(
+		[
+			Lane(points=poly.astype(np.int32), confidence=1.0, source="ufld")
+			for poly in ufld_lanes
+			if poly is not None and len(poly) >= 2
+		]
+	)
+	return lanes_to_mask(lane_set, shape_hw, thickness=thickness)
 
-    cap.release()
-    out.release()
-    print("Saved:", output_path)
 
-if __name__ == "__main__":
-    run_video("input.mp4", "output_lanes.mp4")
+@dataclass
+class FourMasks:
+	"""Container for the four masks you requested."""
+
+	vit_mask: np.ndarray
+	ufld_mask: np.ndarray
+	traditional_mask: np.ndarray
+	yolo_mask: np.ndarray
+
+
+class VisionMaskGenerator:
+	"""Generates 4 masks per frame (ViT, UFLD, Traditional polygon, YOLO)."""
+
+	def __init__(
+		self,
+		*,
+		ufld_weights: Optional[Path] = None,
+		ufld_config: Optional[Path] = None,
+		vit_ckpt: Optional[Path] = None,
+		yolo_weights: str | Path | None = None,
+		yolo_classes: Optional[List[int]] = None,
+		yolo_conf_thres: float = 0.3,
+		device: str | None = None,
+	):
+		paths = _resolve_default_paths()
+
+		ufld_weights = Path(ufld_weights) if ufld_weights is not None else paths["ufld_weights"]
+		ufld_config = Path(ufld_config) if ufld_config is not None else paths["ufld_config"]
+		vit_ckpt = Path(vit_ckpt) if vit_ckpt is not None else paths["vit_ckpt"]
+
+		if yolo_weights is None:
+			yolo_weights = str(paths["yolo_weights"])
+		else:
+			yolo_weights = str(yolo_weights)
+
+		self.ufld = UFLDInferencer(weights_path=ufld_weights, config_path=ufld_config, device=device)
+		self.vit = ViTLaneInferencer(ckpt_path=vit_ckpt, device=device)
+		self.yolo = YOLOInferencer(
+			weights=yolo_weights,
+			device=device,
+			classes=yolo_classes,
+			conf_thres=yolo_conf_thres,
+		)
+
+	def infer_masks(self, frame_bgr: np.ndarray) -> FourMasks:
+		"""Return the four binary masks as uint8 {0,1}, shape (H,W)."""
+		h, w = frame_bgr.shape[:2]
+
+		# 1) ViT mask (best.pt)
+		_vit_prob, vit_mask = self.vit.infer_frame(frame_bgr)
+
+		# 2) UFLD mask
+		ufld_lanes = self.ufld.infer_frame(frame_bgr)
+		ufld_mask = ufld_lanes_to_mask(ufld_lanes, (h, w))
+
+		# 3) Traditional polygon mask
+		trad_mask = traditional_polygon_mask(frame_bgr)
+
+		# 4) YOLO mask
+		yolo_dets = self.yolo.infer_frame(frame_bgr)
+		yolo_mask = yolo_detections_to_mask(yolo_dets, (h, w))
+
+		# Normalize dtypes
+		vit_mask = vit_mask.astype(np.uint8)
+		ufld_mask = ufld_mask.astype(np.uint8)
+		trad_mask = trad_mask.astype(np.uint8)
+		yolo_mask = yolo_mask.astype(np.uint8)
+
+		return FourMasks(
+			vit_mask=vit_mask,
+			ufld_mask=ufld_mask,
+			traditional_mask=trad_mask,
+			yolo_mask=yolo_mask,
+		)
+
+
+def overlay_masks(
+	frame_bgr: np.ndarray,
+	masks: FourMasks,
+	*,
+	alpha: float = 0.25,
+) -> np.ndarray:
+	"""Convenience helper to visualize the 4 masks on top of the frame."""
+	overlay = frame_bgr.copy()
+	color = np.zeros_like(frame_bgr)
+
+	# ViT -> blue
+	color[masks.vit_mask == 1] = (255, 0, 0)
+	# UFLD -> red
+	color[masks.ufld_mask == 1] = (0, 0, 255)
+	# Traditional -> green
+	color[masks.traditional_mask == 1] = (0, 255, 0)
+	# YOLO -> red
+	color[masks.yolo_mask == 1] = (0, 0, 255)
+
+	overlay = cv2.addWeighted(overlay, 1.0, color, alpha, 0.0)
+	return overlay
+
