@@ -23,7 +23,12 @@ for p in (REPO_ROOT, LANESIGHT_ROOT):
 		sys.path.insert(0, p_str)
 
 
-from LANESIGHT.video.infer_video import FourMasks, VisionMaskGenerator, overlay_masks  # noqa: E402
+from LANESIGHT.video.infer_video import (  # noqa: E402
+	FourMasks,
+	VisionMaskGenerator,
+	make_split_2x2,
+	overlay_single_mask,
+)
 
 
 @dataclass(frozen=True)
@@ -85,7 +90,12 @@ def process_video(
 	engine: VisionMaskGenerator,
 	progress: "st.delta_generator.DeltaGenerator",
 	status: "st.delta_generator.DeltaGenerator",
-	preview_slot: "st.delta_generator.DeltaGenerator",
+	preview_slots: Tuple[
+		"st.delta_generator.DeltaGenerator",
+		"st.delta_generator.DeltaGenerator",
+		"st.delta_generator.DeltaGenerator",
+		"st.delta_generator.DeltaGenerator",
+	],
 ) -> Path:
 	cap = cv2.VideoCapture(str(input_path))
 	if not cap.isOpened():
@@ -102,9 +112,13 @@ def process_video(
 		out_fps = min(out_fps, in_fps)
 
 	frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-	frame_step = 1
-	if in_fps > 0 and out_fps > 0:
-		frame_step = max(1, int(round(in_fps / out_fps)))
+	use_pos_msec = True
+	if out_fps <= 0:
+		# Should not happen due to UI constraints, but keep it robust.
+		out_fps = 25.0
+
+	sample_period_s = 1.0 / out_fps
+	next_sample_t_s = 0.0
 
 	# Output temp mp4
 	out_fd, out_tmp = tempfile.mkstemp(suffix=".mp4")
@@ -115,40 +129,78 @@ def process_video(
 		pass
 	out_path = Path(out_tmp)
 
+	# Write split 2x2 (half-res quadrants)
+	w2, h2 = max(1, width // 2), max(1, height // 2)
+	out_size = (w2 * 2, h2 * 2)
+
 	fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-	writer = cv2.VideoWriter(str(out_path), fourcc, out_fps if out_fps > 0 else 25.0, (width, height))
+	writer = cv2.VideoWriter(str(out_path), fourcc, out_fps if out_fps > 0 else 25.0, out_size)
 	if not writer.isOpened():
 		cap.release()
 		raise RuntimeError("Could not open VideoWriter (mp4v).")
 
 	processed = 0
-	read_idx = 0
+	grabbed = 0
 	try:
 		while True:
-			ret, frame_bgr = cap.read()
-			if not ret:
+			# Grab advances the stream cheaply; retrieve only when we actually
+			# want to process/write the frame.
+			if not cap.grab():
 				break
+			grabbed += 1
 
-			if (read_idx % frame_step) != 0:
-				read_idx += 1
+			# Prefer real timestamps when available (handles non-integer FPS better).
+			t_s: float | None = None
+			if use_pos_msec:
+				pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+				if pos_msec > 0:
+					t_s = pos_msec / 1000.0
+				else:
+					# Some backends always report 0; fall back to FPS-based time.
+					use_pos_msec = False
+
+			if t_s is None:
+				if in_fps > 0:
+					t_s = (grabbed - 1) / float(in_fps)
+				else:
+					# No timing info at all; process every frame.
+					t_s = next_sample_t_s
+
+			if t_s + 1e-9 < next_sample_t_s:
 				continue
-			read_idx += 1
+
+			ret, frame_bgr = cap.retrieve()
+			if not ret:
+				continue
+
+			# Move next sample time forward (catch up if we jumped ahead).
+			while next_sample_t_s <= t_s + 1e-9:
+				next_sample_t_s += sample_period_s
 
 			masks = engine.infer_masks(frame_bgr)
 			masks = _selective_masks(masks, cfg)
-			annotated_bgr = overlay_masks(frame_bgr, masks)
 
-			writer.write(annotated_bgr)
+			# 4 separate overlays + titles
+			vit_bgr = overlay_single_mask(frame_bgr, masks.vit_mask, color_bgr=(255, 0, 0), title="1) ViT-Hybrid")
+			yolo_bgr = overlay_single_mask(frame_bgr, masks.yolo_mask, color_bgr=(0, 0, 255), title="2) YOLO")
+			ufld_bgr = overlay_single_mask(frame_bgr, masks.ufld_mask, color_bgr=(0, 255, 0), title="3) UFLD")
+			poly_bgr = overlay_single_mask(frame_bgr, masks.traditional_mask, alpha=0.35, color_bgr=(0, 255, 0), title="4) Polygon")
+
+			# Output frame: 2x2 split (ViT, YOLO, UFLD, Polygon)
+			split_bgr = make_split_2x2(frame_bgr, masks, with_titles=True)
+			writer.write(split_bgr)
 			processed += 1
 
 			if processed % max(1, cfg.preview_every_n_frames) == 0:
-				annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-				preview_slot.image(annotated_rgb, caption=f"Frame {read_idx}", use_container_width=True)
+				preview_slots[0].image(cv2.cvtColor(vit_bgr, cv2.COLOR_BGR2RGB), caption="1) ViT-Hybrid", use_container_width=True)
+				preview_slots[1].image(cv2.cvtColor(yolo_bgr, cv2.COLOR_BGR2RGB), caption="2) YOLO", use_container_width=True)
+				preview_slots[2].image(cv2.cvtColor(ufld_bgr, cv2.COLOR_BGR2RGB), caption="3) UFLD", use_container_width=True)
+				preview_slots[3].image(cv2.cvtColor(poly_bgr, cv2.COLOR_BGR2RGB), caption="4) Polygon", use_container_width=True)
 
 			if frame_count > 0:
-				progress.progress(min(1.0, read_idx / frame_count))
+				progress.progress(min(1.0, grabbed / frame_count))
 				status.write(
-					f"Processing… {read_idx}/{frame_count} frames (written: {processed}), output FPS: {out_fps:.2f}"
+					f"Processing… {grabbed}/{frame_count} frames (written: {processed}), output FPS: {out_fps:.2f}"
 				)
 	finally:
 		cap.release()
@@ -209,8 +261,13 @@ def _page() -> None:
 		)
 
 	with col_right:
-		st.subheader("Preview")
-		preview_slot = st.empty()
+		st.subheader("Preview (Split 2x2)")
+		r1c1, r1c2 = st.columns(2, gap="medium")
+		r2c1, r2c2 = st.columns(2, gap="medium")
+		preview_vit = r1c1.empty()
+		preview_yolo = r1c2.empty()
+		preview_ufld = r2c1.empty()
+		preview_poly = r2c2.empty()
 
 	st.subheader("Output Video")
 	output_video_slot = st.empty()
@@ -245,7 +302,7 @@ def _page() -> None:
 				engine=engine,
 				progress=progress,
 				status=status,
-				preview_slot=preview_slot,
+				preview_slots=(preview_vit, preview_yolo, preview_ufld, preview_poly),
 			)
 
 		video_bytes = out_path.read_bytes()
