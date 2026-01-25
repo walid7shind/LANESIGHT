@@ -225,8 +225,15 @@ def _page() -> None:
 		st.header("Modules")
 		enable_vit = st.checkbox("Hybrid-ViT lane segmentation", value=True)
 		enable_ufld = st.checkbox("UFLD lane detection", value=True)
-		enable_traditional = st.checkbox("Traditional lane processing", value=False)
+		enable_traditional = st.checkbox("Traditional lane processing", value=True)
 		enable_yolo = st.checkbox("YOLO vehicle detection", value=True)
+
+		st.header("Input")
+		uploaded = st.file_uploader(
+			"Upload dashcam video",
+			type=["mp4", "avi", "mov", "mkv"],
+			help="The UI only handles video IO; inference is in LANESIGHT.",
+		)
 
 		st.header("Output")
 		out_fps = st.number_input("Output FPS", min_value=1.0, max_value=120.0, value=20.0, step=1.0)
@@ -250,24 +257,13 @@ def _page() -> None:
 		st.divider()
 		run_clicked = st.button("Run", type="primary", use_container_width=True)
 
-	col_left, col_right = st.columns([1, 1], gap="large")
-
-	with col_left:
-		st.subheader("Input")
-		uploaded = st.file_uploader(
-			"Upload dashcam video",
-			type=["mp4", "avi", "mov", "mkv"],
-			help="The UI only handles video IO; inference is in LANESIGHT.",
-		)
-
-	with col_right:
-		st.subheader("Preview (Split 2x2)")
-		r1c1, r1c2 = st.columns(2, gap="medium")
-		r2c1, r2c2 = st.columns(2, gap="medium")
-		preview_vit = r1c1.empty()
-		preview_yolo = r1c2.empty()
-		preview_ufld = r2c1.empty()
-		preview_poly = r2c2.empty()
+	st.subheader("Preview (Split 2x2)")
+	r1c1, r1c2 = st.columns(2, gap="large")
+	r2c1, r2c2 = st.columns(2, gap="large")
+	preview_vit = r1c1.empty()
+	preview_yolo = r1c2.empty()
+	preview_ufld = r2c1.empty()
+	preview_poly = r2c2.empty()
 
 	st.subheader("Output Video")
 	output_video_slot = st.empty()
