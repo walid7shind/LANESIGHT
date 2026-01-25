@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -159,15 +158,97 @@ def overlay_masks(
 	overlay = frame_bgr.copy()
 	color = np.zeros_like(frame_bgr)
 
+	# Treat any nonzero mask as active (some producers output 0/255).
+	vit_on = masks.vit_mask != 0
+	ufld_on = masks.ufld_mask != 0
+	poly_on = masks.traditional_mask != 0
+	yolo_on = masks.yolo_mask != 0
+
 	# ViT -> blue
-	color[masks.vit_mask == 1] = (255, 0, 0)
-	# UFLD -> red
-	color[masks.ufld_mask == 1] = (0, 0, 255)
-	# Traditional -> green
-	color[masks.traditional_mask == 1] = (0, 255, 0)
+	color[vit_on] = (255, 0, 0)
+	# UFLD -> green
+	color[ufld_on] = (0, 255, 0)
+	# Traditional polygon -> green
+	color[poly_on] = (0, 255, 0)
 	# YOLO -> red
-	color[masks.yolo_mask == 1] = (0, 0, 255)
+	color[yolo_on] = (0, 0, 255)
 
 	overlay = cv2.addWeighted(overlay, 1.0, color, alpha, 0.0)
 	return overlay
+
+
+def overlay_single_mask(
+	frame_bgr: np.ndarray,
+	mask01: np.ndarray,
+	*,
+	alpha: float = 0.25,
+	color_bgr: Tuple[int, int, int] = (255, 0, 0),  # blue in BGR
+	title: str | None = None,
+) -> np.ndarray:
+	"""Overlay a single uint8 {0,1} mask onto a frame (all masks use same color)."""
+	overlay = frame_bgr.copy()
+	color = np.zeros_like(frame_bgr)
+	color[mask01 != 0] = color_bgr
+	out = cv2.addWeighted(overlay, 1.0, color, alpha, 0.0)
+
+	if title:
+		cv2.putText(
+			out,
+			title,
+			(12, 32),
+			cv2.FONT_HERSHEY_SIMPLEX,
+			1.0,
+			(255, 255, 255),
+			2,
+			cv2.LINE_AA,
+		)
+		cv2.putText(
+			out,
+			title,
+			(12, 32),
+			cv2.FONT_HERSHEY_SIMPLEX,
+			1.0,
+			(0, 0, 0),
+			5,
+			cv2.LINE_AA,
+		)
+	return out
+
+
+def make_split_2x2(
+	frame_bgr: np.ndarray,
+	masks: FourMasks,
+	*,
+	alpha: float = 0.25,
+	vit_color_bgr: Tuple[int, int, int] = (255, 0, 0),
+	yolo_color_bgr: Tuple[int, int, int] = (0, 0, 255),
+	ufld_color_bgr: Tuple[int, int, int] = (0, 255, 0),
+	poly_color_bgr: Tuple[int, int, int] = (0, 255, 0),
+	with_titles: bool = True,
+) -> np.ndarray:
+	"""
+	Return a 2x2 split-screen BGR frame:
+	(1) ViT (top-left), (2) YOLO (top-right), (3) UFLD (bottom-left), (4) Polygon (bottom-right)
+	Colors: ViT blue, YOLO red, UFLD green, Polygon green.
+	"""
+	h, w = frame_bgr.shape[:2]
+	h2, w2 = max(1, h // 2), max(1, w // 2)
+	out_h, out_w = h2 * 2, w2 * 2
+
+	vit = overlay_single_mask(frame_bgr, masks.vit_mask, alpha=alpha, color_bgr=vit_color_bgr, title=("ViT-Hybrid" if with_titles else None))
+	yolo = overlay_single_mask(frame_bgr, masks.yolo_mask, alpha=alpha, color_bgr=yolo_color_bgr, title=("YOLO" if with_titles else None))
+	ufld = overlay_single_mask(frame_bgr, masks.ufld_mask, alpha=alpha, color_bgr=ufld_color_bgr, title=("UFLD" if with_titles else None))
+	poly = overlay_single_mask(frame_bgr, masks.traditional_mask, alpha=alpha, color_bgr=poly_color_bgr, title=("Polygon" if with_titles else None))
+
+	vit = cv2.resize(vit, (w2, h2), interpolation=cv2.INTER_AREA)
+	yolo = cv2.resize(yolo, (w2, h2), interpolation=cv2.INTER_AREA)
+	ufld = cv2.resize(ufld, (w2, h2), interpolation=cv2.INTER_AREA)
+	poly = cv2.resize(poly, (w2, h2), interpolation=cv2.INTER_AREA)
+
+	top = np.hstack([vit, yolo])
+	bot = np.hstack([ufld, poly])
+	grid = np.vstack([top, bot])
+
+	# Ensure exact even dimensions (for odd input sizes).
+	return grid[:out_h, :out_w].copy()
 

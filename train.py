@@ -256,8 +256,8 @@ if __name__ == "__main__":
 
     data_root = os.path.join(script_dir, "data")
 
-    train_list = os.path.join(data_root, "list", "train_clean.txt")
-    val_list   = os.path.join(data_root, "list", "val_clean.txt")
+    train_list = os.path.join(data_root, "list", "train_gt.txt")
+    val_list   = os.path.join(data_root, "list", "val_gt.txt")
 
     train(
         root=data_root,
